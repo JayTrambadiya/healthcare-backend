@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: MRF Backend — S3, Lambda, API Gateway, SQS, DynamoDB, Cognito
+
+# ─── Parameters ───────────────────────────────────────────────────────────────
+Parameters:
+  Env:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  FrontendOrigin:
+    Type: String
+    Description: CORS allowed origin (e.g. https://app.example.com)
+  GoogleClientId:
+    Type: String
+    NoEcho: true
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+
+# ─── Globals ──────────────────────────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_NAME: !Ref JobsTable
+        S3_BUCKET_NAME: !Ref MrfBucket
+        FRONTEND_ORIGIN: !Ref FrontendOrigin
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── Cognito ────────────────────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub mrf-users-${Env}
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  GoogleIdentityProvider:
+    Type: AWS::Cognito::UserPoolIdentityProvider
+    Properties:
+      UserPoolId: !Ref UserPool
+      ProviderName: Google
+      ProviderType: Google
+      ProviderDetails:
+        client_id: !Ref GoogleClientId
+        client_secret: !Ref GoogleClientSecret
+        authorize_scopes: "email openid profile"
+      AttributeMapping:
+        email: email
+        name: name
+        username: sub
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GoogleIdentityProvider
+    Properties:
+      ClientName: !Sub mrf-client-${Env}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false          # SPA — no client secret on frontend
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+        - Google
+      CallbackURLs:
+        - !Sub "${FrontendOrigin}/auth/callback"
+      LogoutURLs:
+        - !Sub "${FrontendOrigin}/auth/logout"
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [email, openid, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub mrf-auth-${Env}-${AWS::AccountId}
+      UserPoolId: !Ref UserPool
+
+  # ── S3 ─────────────────────────────────────────────────────────────────────
+  MrfBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ProcessingQueuePolicy
+    Properties:
+      BucketName: !Sub mrf-files-${Env}-${AWS::AccountId}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref FrontendOrigin]
+            AllowedMethods: [GET, PUT]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "uploads/"
+            Queue: !GetAtt ProcessingQueue.Arn
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawUploads
+            Status: Enabled
+            Prefix: "uploads/"
+            ExpirationInDays: 7
+
+  MrfBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MrfBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadMrfFiles
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${MrfBucket}/public/mrf-files/*"
+
+  # ── SQS ────────────────────────────────────────────────────────────────────
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub mrf-processing-${Env}
+      VisibilityTimeout: 120   # Must be >= Lambda timeout
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  ProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub mrf-processing-dlq-${Env}
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Allow S3 to send messages to SQS
+  ProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ProcessingQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ProcessingQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::mrf-files-${Env}-${AWS::AccountId}"
+
+  # ── DynamoDB ───────────────────────────────────────────────────────────────
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub mrf-jobs-${Env}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: jobId
+          KeyType: RANGE
+
+  # ── API Gateway ────────────────────────────────────────────────────────────
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Env
+      CorsConfiguration:
+        AllowOrigins: [!Ref FrontendOrigin]
+        AllowHeaders: [Content-Type, Authorization]
+        AllowMethods: [GET, POST, OPTIONS]
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
+
+  # ── Lambda functions ───────────────────────────────────────────────────────
+  PresignFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub mrf-presign-${Env}
+      CodeUri: ../src/
+      Handler: handlers/presignHandler.lambdaHandler
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref MrfBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /upload/presign
+            Method: POST
+
+  JobsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub mrf-jobs-${Env}
+      CodeUri: ../src/
+      Handler: handlers/jobsHandler.lambdaHandler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref JobsTable
+      Events:
+        ListJobs:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /jobs
+            Method: GET
+        GetJob:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /jobs/{jobId}
+            Method: GET
+
+  ProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub mrf-process-${Env}
+      CodeUri: ../src/
+      Handler: handlers/processHandler.lambdaHandler
+      Timeout: 90
+      MemorySize: 512
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref MrfBucket
+        - S3WritePolicy:
+            BucketName: !Ref MrfBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref JobsTable
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ProcessingQueue.QueueName
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 5
+            FunctionResponseTypes:
+              - ReportBatchItemFailures   # Partial batch failure support
+
+# ─── Outputs ──────────────────────────────────────────────────────────────────
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Env}"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub "https://mrf-auth-${Env}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+  BucketName:
+    Value: !Ref MrfBucket
