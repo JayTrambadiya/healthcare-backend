@@ -136,7 +136,7 @@ You also need:
 ### 1. Clone and install
 
 ```powershell
-git clone https://github.com/YOUR_USER/mrf-app.git
+git clone https://github.com/JayTrambadiya/healthcare-backend.git
 cd mrf-app
 
 # Install Lambda dependencies (must be inside src/)
@@ -168,23 +168,6 @@ copy .env.example .env
 S3_BUCKET_NAME=mrf-files-dev-YOUR_ACCOUNT_ID
 DYNAMODB_TABLE_NAME=mrf-jobs-dev
 FRONTEND_ORIGIN=http://localhost:5173
-
-# Frontend (Vite — must be prefixed VITE_)
-VITE_AWS_REGION=ap-south-1
-VITE_COGNITO_USER_POOL_ID=ap-south-1_XXXXXXXX
-VITE_COGNITO_CLIENT_ID=xxxxxxxxxxxxxxxxxxxx
-VITE_COGNITO_DOMAIN=https://mrf-auth-dev-ACCOUNTID.auth.ap-south-1.amazoncognito.com
-VITE_API_BASE_URL=https://xxxxxxxxxx.execute-api.ap-south-1.amazonaws.com/dev
-```
-
-### 4. Run the frontend locally
-
-```powershell
-cd frontend
-npm install
-npm run dev
-# → http://localhost:5173
-```
 
 > The backend Lambdas run on AWS even during local development — SAM local is optional (see below). The frontend talks to your deployed API Gateway URL.
 
