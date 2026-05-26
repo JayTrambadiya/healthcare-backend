@@ -6,3 +6,5 @@ node_modules/
 samconfig.toml
 dist/
 *.local
+.idea
+*.iml
