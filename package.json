@@ -1,0 +1,20 @@
+{
+  "name": "mrf-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "lint": "eslint src/**/*.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0",
+    "amazon-cognito-identity-js": "^6.3.12"
+  },
+  "devDependencies": {
+    "eslint": "^9.5.0",
+    "jest": "^29.7.0"
+  }
+}
